@@ -5,63 +5,46 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
+import GUI
 
 
-def get_tabs(driver):
-    tab_list = driver.find_elements(By.CLASS_NAME, 'LQUZJ')
-    tab_links = []
-    tab_list[:] = [x for x in tab_list if x.text.__contains__('Guitar Pro')]
-    for i in tab_list:
-        tab_links.append(i.find_element(By.CSS_SELECTOR, '.HT3w5').get_attribute('href'))
-    how_many_tabs = len(tab_list)
-    print('Found ' + str(how_many_tabs) + ' Guitar Pro Files')
-    # download for each element, skipping pro or official
-    download_count = 0
-    failure_count = 0
-    for i in range(how_many_tabs):
-        tries = 1
-        while True:  # used to restart iterations of for loop
-            tries += 1
-            if tries > 9:  # Count # of tries for current file, to prevent getting stuck
-                print('Too many download attempts, moving on.')
-                failurelog = open('failurelog.txt', 'a')
-                failurelog.write(tab_links[i])
-                failurelog.write('\n')
-                failurelog.close()
-                break
-            print(tab_links[i])
-            driver.get(str(tab_links[i]))
+def download_tab(driver, url):
 
-            scroll_to_bottom(driver)
-            try:
-                button = driver.find_element(By.CSS_SELECTOR, 'button.exTWY:nth-child(2)')
-            except Exception as e:  # sometimes the button is obscured by other elements
-                print(e)
-                print('Button obscured? trying again.') # I don't think this error is ever hitting
-                failure_count += 1
-                continue
-            try:
-                if driver.which_browser == 'Chrome':
-                    driver.execute_script('arguments[0].click();', WebDriverWait(driver, 20).until(EC.element_to_be_clickable(button)))
-                if driver.which_browser == 'Firefox':
-                    driver.execute_script('arguments[0].click();', WebDriverWait(driver, 20).until(EC.element_to_be_clickable(button)))
-                    time.sleep(.6)  # think this can go down to .5 at least todo optimize
-                download_count += 1
-                tries = 0
-                break
-            except (TypeError, selenium.common.exceptions.ElementNotInteractableException):
-                print('ElementNotInteractableException, retrying page.')
-                print("Try number: " + str(tries))
-                failure_count += 1
-            except Exception as e:
-                print(e.args[0])
-                print('Something went wrong, retrying page')
-                print("Try number: " + str(tries))
-                failure_count += 1
-    return [download_count, failure_count]
+    print(f"⬇️ Downloading {url}")
+    try:
+        # Attempt download via clicking Download button
+        driver.get(url)
+        scroll_to_bottom(driver)
+        button = driver.find_element(By.CSS_SELECTOR, "form[action='https://tabs.ultimate-guitar.com/tab/download'] button")
+        button.click()
+    except Exception as e:  # sometimes the button is obscured by other elements
+        print(e)
+        print("⚠️ Can't use download button, using fallback download method")
+        download_tab_fallback(driver, url)
+
+
+def download_tab_fallback(driver, url):
+    ''' This method opens the download link directly in the browser instead
+    of using the Download Tab button. This can be used when the button doesn't
+    exist (removed tab) or is otherwise unusable. This method works almost all
+    of the time, but occasionally will only load the tab's interactive page
+    instead of a download link. This may happen because the tab doesn't
+    actually exist on UG's server. So this should not be used as the primary
+    download strategy, but only as a fallback.
+    '''
+    if driver.current_url != url:
+        driver.get(url)
+
+    uid = url.split('-')[-1]
+    js_dl = f"window.open('https://tabs.ultimate-guitar.com/tab/download?id={uid}');"
+    driver.execute_script(js_dl)
+    time.sleep(0.5)
 
 
 def create_artist_folder(dl_path):
+    if os.path.isdir(dl_path):
+        print("Using folder at " + dl_path)
+        return
     try:
         os.mkdir(dl_path)
     except OSError as error:

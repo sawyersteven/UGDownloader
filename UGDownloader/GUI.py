@@ -14,6 +14,9 @@ import DLoader
 import datetime
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service as ChromeService
+import threading
+
+EXITING = False
 
 
 class GUI:
@@ -49,9 +52,6 @@ class GUI:
                      text="-Ultimate Guitar requires a login to download tabs. If you just created an account, "
                           "you may have to wait a day or two for the captcha to stop appearing (this program won't"
                           "work while that's appearing).")],
-            [sg.Text(size=(30, 5), justification='center',
-                     text="-Autofill will automatically enter a dummy account, but no guarantees for how long"
-                          "this will work for.")],
             [sg.HSeparator()],
             [sg.Text()],
             # [sg.HSeparator()],
@@ -69,11 +69,14 @@ class GUI:
         # end layout
 
         window = sg.Window("Ultimate Guitar Downloader", layout)
+        _, _ = window.read(1)
+        autofill_user(window)
+        dlthread = None
         while True:
             event, values = window.read()
             if event == "Save Info":
                 # todo protect against the file being empty
-                artist = 'a' # just to not trip the validation method
+                artist = 'a'  # just to not trip the validation method
                 user = values['-USERNAME-']
                 password = values['-PASSWORD-']
                 if not validate(artist, user, password):
@@ -84,13 +87,8 @@ class GUI:
                 userinfo.write(values['-PASSWORD-'])
                 userinfo.close()
             if event == "Autofill":
-                # dummy account: user=mygoodusername, pass=passyword
-                userinfo = open('userinfo.txt', 'r')
-                data = ''
-                for line in userinfo:
-                    data = line.split()
-                window["-USERNAME-"].update(data[0])  # todo get username and password from text file
-                window["-PASSWORD-"].update(data[1])
+                autofill_user(window)
+
             if event == "Download":
                 artist = values['-ARTIST-']
                 user = values['-USERNAME-']
@@ -99,24 +97,70 @@ class GUI:
                     continue
                 headless = values['-HEADLESS-']
                 which_browser = values['-BROWSER-']
-                driver = start_browser(artist, headless, which_browser)
-                try:
-                    start_download(driver, artist, user, password)
-                    driver.close()
-                    sg.popup('Downloads finished.')
-                except Exception as e:
-                    print(e)
-                    driver.close()
-                    sg.popup_error("Something went wrong with the download. Try again- check that the "
-                                   "artist you entered is on the site, and has guitar pro tabs available.")
+
+                window["Download"].update(disabled=True)
+                dlthread = threading.Thread(name="DownloadInThread", target=_download_in_thread, args=(artist, headless, which_browser, user, password, sg, window))
+                dlthread.start()
+                # try:
+                #     driver = start_browser(artist, headless, which_browser)
+                #     try:
+                #         start_download(driver, artist, user, password)
+                #         driver.close()
+                #         sg.popup('Downloads finished.')
+                #     except Exception as e:
+                #         print(e)
+                #         driver.close()
+                #         sg.popup_error("Something went wrong with the download. Try again- check that the "
+                #                        "artist you entered is on the site, and has guitar pro tabs available.")
+                # finally:
+                #     window["Download"].update(disabled=False)
 
             if event == "Exit" or event == sg.WIN_CLOSED:
+                print("Exit signal sent")
+                EXIT_FLAG = True
+                if dlthread is not None:
+                    dlthread.join()
                 break
 
         window.close()
 
 
+def _download_in_thread(artist, headless, which_browser, user, password, sg, window):
+    try:
+        driver = start_browser(artist, headless, which_browser)
+        if EXITING:  # this is ugly, but so are python threads
+            return
+        login(driver, user, password)
+        if EXITING:
+            return
+        start_download(driver, artist, user, password)
+        # driver.close()
+        print("✅ Downloads complete")
+    except Exception as e:
+        print(f"⚠️{e}")
+        # driver.close()
+    finally:
+        window["Download"].update(disabled=False)
+        # driver.close()
+
+
+def autofill_user(window):
+    try:
+        user_info = []
+        with open('userinfo.txt', 'r') as f:
+            user_info = f.read().strip().splitlines()
+
+        if len(user_info) != 2:
+            raise Exception("Invalid userinfo.txt contents")
+
+        window["-USERNAME-"].update(user_info[0])
+        window["-PASSWORD-"].update(user_info[1])
+    except Exception as e:
+        print(e)
+
+
 def start_browser(artist, headless, which_browser):
+    print("Launching browser")
     # find path of Tabs folder, and set browser options
     dl_path = str(Path.cwd())
     dl_path += '\\Tabs\\'
@@ -178,37 +222,51 @@ def start_download(driver, artist, user, password):
     driver.set_window_size(1100, 1000)
     driver.find_element(By.LINK_TEXT, artist).click()
     driver.find_element(By.LINK_TEXT, 'Guitar Pro').click()
-    login(driver, user, password)
     print('Starting downloads...')
-    current_page = driver.current_url
+
     download_count = 0
     failure_count = 0
+
+    tab_links = []
+    page = 1
+    # crawl through all pages and collect guitar pro links
     while True:
-        results = DLoader.get_tabs(driver)
-        download_count += results[0]
-        failure_count += results[1]
-        driver.get(current_page)
+        if EXITING:
+            return
+
+        print(f"Reading page {page}")
+        current_page_tabs = [x for x in driver.find_elements(By.CLASS_NAME, 'LQUZJ') if x.text.__contains__('Guitar Pro')]
+        for i in current_page_tabs:
+            tab_links.append(i.find_element(By.CSS_SELECTOR, '.HT3w5').get_attribute('href'))
+
         if driver.find_elements(By.CLASS_NAME, 'BvSfz'):
-            print("There's another page")
+            page += 1
             driver.find_element(By.CLASS_NAME, 'BvSfz').click()
-            current_page = driver.current_url
             continue
         else:
-            # todo end message here
-            print('Downloads Finished. Total number of downloads: ' + str(
-                download_count) + '.')  # todo move this out of this method
-            print('Total number of failures: ' + str(failure_count))
             break
+
+    print(f"🔎 Found links to {len(tab_links)} Guitar Pro tabs")
+    failed = 0
+    for url in tab_links:
+        if EXITING:
+            return
+        DLoader.download_tab(driver, url)
 
 
 def login(driver, user, password):
-    driver.find_element(By.CSS_SELECTOR, '.exTWY > span:nth-child(1)').click()  # login button
+    driver.get('https://www.ultimate-guitar.com/')
+    driver.find_element(By.CSS_SELECTOR, 'button.exTWY').click()  # login button
     time.sleep(1)
-    username_textbox = driver.find_element(By.CSS_SELECTOR, '.wzvZg > div:nth-child(1) > input:nth-child(1)')
-    password_textbox = driver.find_element(By.CSS_SELECTOR, '.wlfii > div:nth-child(1) > input:nth-child(1)')
+    form = driver.find_element(By.CSS_SELECTOR, "form > div.PictU")
+    username_textbox = form.find_element(By.CSS_SELECTOR, 'input[name=username]')
+    password_textbox = form.find_element(By.CSS_SELECTOR, 'input[type=password]')
+    submit_button = form.find_element(By.CSS_SELECTOR, 'button[type=submit]')
+
     username_textbox.send_keys(user)
     password_textbox.send_keys(password)
-    password_textbox.send_keys(Keys.RETURN)
+    time.sleep(1)
+    submit_button.click()
     # todo deal with captcha here
     # captcha css selectors
     # #captchak8gPWM_TLJs0GssOrg0gG > div:nth-child(1) > div:nth-child(1) > iframe:nth-child(1)
@@ -232,10 +290,10 @@ def login(driver, user, password):
     # WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn.btn-primary.block.full-width.m-b"))).click()
     # time.sleep(.5)
     # this popup sometimes takes some time to appear, wait until it's clickable
-    element = WebDriverWait(driver, 20).until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR,
-                                    'button.RwBUh:nth-child(1) > svg:nth-child(1) > path:nth-child(1)')))
-    element.click()
+    # element = WebDriverWait(driver, 20).until(
+    #     EC.element_to_be_clickable((By.CSS_SELECTOR,
+    #                                 'button.RwBUh:nth-child(1) > svg:nth-child(1) > path:nth-child(1)')))
+    # element.click()
 
     print('Logged in')
 
