@@ -16,27 +16,27 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service as ChromeService
 import threading
 
-EXITING = False
-
 
 class GUI:
 
     def __init__(self):
-
+        self.exit_sig = threading.Event()
         # start layout
         left_column = [
-            [sg.Text(text='Artist', size=(10, 1)), sg.Input(size=(25, 1), pad=(0, 10), key="-ARTIST-"),
-             sg.Button(button_text='Save Info')],
             [sg.Text(text='Username', size=(10, 1)), sg.Input(size=(25, 1), pad=(0, 10), key="-USERNAME-"),
-             sg.Button(button_text='Autofill'), sg.Checkbox('Run in background', default=True, key="-HEADLESS-")],
-            [sg.Text(text='Password', size=(10, 1)), sg.Input(size=(25, 1), pad=(0, 10), key="-PASSWORD-"),
-             sg.Button(button_text='Download'), sg.Combo(values=('Firefox', 'Chrome'), default_value='Firefox',
-                                                         key="-BROWSER-")],
+             sg.Text(text='Password', size=(10, 1)), sg.Input(size=(25, 1), pad=(0, 10), key="-PASSWORD-"),
+             sg.Button(button_text='Save Info', tooltip="Save to userinfo.txt to automatically fill fields")],
+            [sg.HorizontalSeparator()],
+            [sg.Text(text='Artist', size=(10, 1)), sg.Input(size=(25, 1), pad=(0, 10), key="-ARTIST-"),
+             sg.Combo(values=('Guitar Pro', 'Power'), default_value='Guitar Pro', key="-DOWNLOADTYPE-")],
+
+            [sg.Combo(values=('Firefox', 'Chrome'), default_value='Firefox', key="-BROWSER-"),
+             sg.Checkbox(text="Run in background", default=False, key="-HEADLESS-"),
+             sg.Button(button_text='Download')],
             [sg.HSeparator()],
             [sg.Multiline(size=(60, 15), font='Courier 8', expand_x=True, expand_y=True,
                           write_only=True, reroute_stdout=True, reroute_stderr=True, echo_stdout_stderr=True,
                           autoscroll=True, auto_refresh=True)
-             # [sg.Output(size=(60,15), font='Courier 8', expand_x=True, expand_y=True)]
              ]
         ]
 
@@ -54,7 +54,6 @@ class GUI:
                           "work while that's appearing).")],
             [sg.HSeparator()],
             [sg.Text()],
-            # [sg.HSeparator()],
             [sg.Button(button_text='Exit')]
         ]
 
@@ -86,38 +85,20 @@ class GUI:
                 userinfo.write(' ')
                 userinfo.write(values['-PASSWORD-'])
                 userinfo.close()
-            if event == "Autofill":
-                autofill_user(window)
-
             if event == "Download":
                 artist = values['-ARTIST-']
                 user = values['-USERNAME-']
                 password = values['-PASSWORD-']
                 if not validate(artist, user, password):
                     continue
-                headless = values['-HEADLESS-']
-                which_browser = values['-BROWSER-']
 
                 window["Download"].update(disabled=True)
-                dlthread = threading.Thread(name="DownloadInThread", target=_download_in_thread, args=(artist, headless, which_browser, user, password, sg, window))
-                dlthread.start()
-                # try:
-                #     driver = start_browser(artist, headless, which_browser)
-                #     try:
-                #         start_download(driver, artist, user, password)
-                #         driver.close()
-                #         sg.popup('Downloads finished.')
-                #     except Exception as e:
-                #         print(e)
-                #         driver.close()
-                #         sg.popup_error("Something went wrong with the download. Try again- check that the "
-                #                        "artist you entered is on the site, and has guitar pro tabs available.")
-                # finally:
-                #     window["Download"].update(disabled=False)
 
+                dlthread = threading.Thread(name="DownloadInThread", target=_download_in_thread, args=(values['-BROWSER-'], values['-HEADLESS-'], artist, values['-DOWNLOADTYPE-'], user, password, sg, window, self.exit_sig))
+                dlthread.start()
             if event == "Exit" or event == sg.WIN_CLOSED:
                 print("Exit signal sent")
-                EXIT_FLAG = True
+                self.exit_sig.set()
                 if dlthread is not None:
                     dlthread.join()
                 break
@@ -125,20 +106,18 @@ class GUI:
         window.close()
 
 
-def _download_in_thread(artist, headless, which_browser, user, password, sg, window):
+def _download_in_thread(which_browser, headless, artist, downloadtype, user, password, sg, window, exit_sig):
     try:
         driver = start_browser(artist, headless, which_browser)
-        if EXITING:  # this is ugly, but so are python threads
+        if exit_sig.is_set():  # this is ugly, but so are python threads
             return
         login(driver, user, password)
-        if EXITING:
+        if exit_sig.is_set():
             return
-        start_download(driver, artist, user, password)
-        # driver.close()
+        start_download(driver, artist, user, password, downloadtype, exit_sig)
         print("✅ Downloads complete")
     except Exception as e:
         print(f"⚠️{e}")
-        # driver.close()
     finally:
         window["Download"].update(disabled=False)
         # driver.close()
@@ -210,7 +189,7 @@ def start_browser(artist, headless, which_browser):
     return driver
 
 
-def start_download(driver, artist, user, password):
+def start_download(driver, artist, user, password, downloadtype, exit_sig):
     # create log of download attempt
     failurelog = open('failurelog.txt', 'a')
     failurelog.write('\n')
@@ -221,7 +200,7 @@ def start_download(driver, artist, user, password):
     driver.get('https://www.ultimate-guitar.com/search.php?search_type=bands&value=' + artist)
     driver.set_window_size(1100, 1000)
     driver.find_element(By.LINK_TEXT, artist).click()
-    driver.find_element(By.LINK_TEXT, 'Guitar Pro').click()
+    driver.find_element(By.LINK_TEXT, downloadtype).click()
     print('Starting downloads...')
 
     download_count = 0
@@ -229,13 +208,10 @@ def start_download(driver, artist, user, password):
 
     tab_links = []
     page = 1
-    # crawl through all pages and collect guitar pro links
-    while True:
-        if EXITING:
-            return
-
+    # crawl through all pages and collect links
+    while not exit_sig.is_set():
         print(f"Reading page {page}")
-        current_page_tabs = [x for x in driver.find_elements(By.CLASS_NAME, 'LQUZJ') if x.text.__contains__('Guitar Pro')]
+        current_page_tabs = [x for x in driver.find_elements(By.CLASS_NAME, 'LQUZJ') if x.text.__contains__(downloadtype)]
         for i in current_page_tabs:
             tab_links.append(i.find_element(By.CSS_SELECTOR, '.HT3w5').get_attribute('href'))
 
@@ -246,10 +222,10 @@ def start_download(driver, artist, user, password):
         else:
             break
 
-    print(f"🔎 Found links to {len(tab_links)} Guitar Pro tabs")
+    print(f"🔎 Found links to {len(tab_links)} {downloadtype} tabs")
     failed = 0
     for url in tab_links:
-        if EXITING:
+        if exit_sig.is_set():
             return
         DLoader.download_tab(driver, url)
 
